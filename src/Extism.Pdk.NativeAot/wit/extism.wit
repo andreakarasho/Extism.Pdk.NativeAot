@@ -1,0 +1,47 @@
+package extism:host;
+
+interface env {
+    // Input
+    input-length: func() -> u64;
+    input-load-u8: func(offset: u64) -> u8;
+    input-load-u64: func(offset: u64) -> u64;
+
+    // Output
+    output-set: func(offset: u64, length: u64);
+
+    // Memory
+    alloc: func(size: u64) -> u64;
+    free: func(offset: u64);
+    length: func(offset: u64) -> u64;
+    load-u8: func(offset: u64) -> u8;
+    load-u64: func(offset: u64) -> u64;
+    store-u8: func(offset: u64, value: u8);
+    store-u64: func(offset: u64, value: u64);
+
+    // Config
+    config-get: func(key-offset: u64) -> u64;
+
+    // Error
+    error-set: func(offset: u64);
+
+    // Vars
+    var-get: func(key-offset: u64) -> u64;
+    var-set: func(key-offset: u64, value-offset: u64);
+
+    // Logging
+    log-trace: func(offset: u64);
+    log-debug: func(offset: u64);
+    log-info: func(offset: u64);
+    log-warn: func(offset: u64);
+    log-error: func(offset: u64);
+    get-log-level: func() -> s32;
+
+    // HTTP
+    http-request: func(req-offset: u64, body-offset: u64) -> u64;
+    http-status-code: func() -> s32;
+    http-headers: func() -> u64;
+}
+
+world extism-plugin {
+    import env;
+}

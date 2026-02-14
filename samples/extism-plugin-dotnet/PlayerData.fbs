@@ -1,0 +1,9 @@
+namespace ExamplePlugin;
+
+table PlayerData {
+  name: string;
+  score: int;
+  inventory: [string];
+}
+
+root_type PlayerData;

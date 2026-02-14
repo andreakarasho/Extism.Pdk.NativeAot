@@ -1,0 +1,90 @@
+<Project>
+
+  <PropertyGroup>
+    <_ExtismPdkRoot>$(MSBuildThisFileDirectory)..\</_ExtismPdkRoot>
+  </PropertyGroup>
+
+  <!-- Source generator for [ExtismExport] -->
+  <ItemGroup>
+    <ProjectReference Include="$(_ExtismPdkRoot)..\Extism.Pdk.SourceGenerator\Extism.Pdk.SourceGenerator.csproj"
+                      OutputItemType="Analyzer"
+                      ReferenceOutputAssembly="false" />
+  </ItemGroup>
+
+  <!-- Auto-register the base Extism WIT (imports only) -->
+  <ItemGroup>
+    <WasmComponentTypeWit Include="$(_ExtismPdkRoot)wit\extism.wit" />
+  </ItemGroup>
+
+  <!-- Inline task: scan source files for [ExtismExport("...")] and generate WIT -->
+  <UsingTask TaskName="GenerateExtismWit" TaskFactory="RoslynCodeTaskFactory" AssemblyFile="$(MSBuildToolsPath)\Microsoft.Build.Tasks.Core.dll">
+    <ParameterGroup>
+      <SourceFiles ParameterType="Microsoft.Build.Framework.ITaskItem[]" Required="true" />
+      <OutputFile ParameterType="System.String" Required="true" />
+      <ExportsFound ParameterType="System.Boolean" Output="true" />
+    </ParameterGroup>
+    <Task>
+      <Using Namespace="System.IO" />
+      <Using Namespace="System.Text.RegularExpressions" />
+      <Code Type="Fragment" Language="cs"><![CDATA[
+var exports = new System.Collections.Generic.List<string>();
+var regex = new Regex(@"\[ExtismExport\(\s*""([^""]+)""\s*\)\]");
+foreach (var item in SourceFiles)
+{
+    var path = item.GetMetadata("FullPath");
+    if (!File.Exists(path)) continue;
+    var content = File.ReadAllText(path);
+    content = Regex.Replace(content, @"/\*.*?\*/", "", RegexOptions.Singleline);
+    content = Regex.Replace(content, @"//.*$", "", RegexOptions.Multiline);
+    foreach (Match match in regex.Matches(content))
+    {
+        var name = match.Groups[1].Value;
+        if (!exports.Contains(name))
+            exports.Add(name);
+    }
+}
+ExportsFound = exports.Count > 0;
+if (ExportsFound)
+{
+    var dir = Path.GetDirectoryName(OutputFile);
+    if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir))
+        Directory.CreateDirectory(dir);
+    using (var sw = new StreamWriter(OutputFile))
+    {
+        sw.WriteLine("package extism:plugin;");
+        sw.WriteLine();
+        sw.WriteLine("world plugin {");
+        foreach (var name in exports)
+        {
+            sw.WriteLine("    export " + name.Replace('_', '-') + ": func() -> u32;");
+        }
+        sw.WriteLine("}");
+    }
+}
+]]>
+      </Code>
+    </Task>
+  </UsingTask>
+
+  <!-- Auto-generate plugin WIT from [ExtismExport] attributes -->
+  <Target Name="GenerateExtismPluginWit" BeforeTargets="CoreCompile">
+    <GenerateExtismWit SourceFiles="@(Compile)" OutputFile="$(IntermediateOutputPath)plugin.wit">
+      <Output TaskParameter="ExportsFound" PropertyName="_ExtismExportsFound" />
+    </GenerateExtismWit>
+    <ItemGroup Condition="'$(_ExtismExportsFound)' == 'true'">
+      <WasmComponentTypeWit Include="$(IntermediateOutputPath)plugin.wit" />
+    </ItemGroup>
+  </Target>
+
+  <!-- Post-publish: unbundle component model, stub WASI imports, convert namespaces -->
+  <Target Name="ClipWasm" AfterTargets="Publish" Condition="'$(RuntimeIdentifier)' == 'wasi-wasm'">
+    <PropertyGroup>
+      <_NativeDir>bin/$(Configuration)/$(TargetFramework)/$(RuntimeIdentifier)/native</_NativeDir>
+      <_ClipScript>$(_ExtismPdkRoot)tools\clip.py</_ClipScript>
+      <_WasmFile>$(_NativeDir)/$(AssemblyName).wasm</_WasmFile>
+    </PropertyGroup>
+    <Exec Command="python &quot;$(_ClipScript)&quot; --namespaces env,debug,extism:host/env,extism:host/user &quot;$(_WasmFile)&quot; &quot;$(_NativeDir)/$(AssemblyName)_clipped.wasm&quot;" />
+    <Message Importance="High" Text="Clipped WASM written to $(_NativeDir)/$(AssemblyName)_clipped.wasm" />
+  </Target>
+
+</Project>

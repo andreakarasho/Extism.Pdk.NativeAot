@@ -1,0 +1,18 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+  </PropertyGroup>
+
+
+  <!-- Ship build/, tools/, and wit/ so consuming projects (and NuGet packages) get them -->
+  <ItemGroup>
+    <None Include="build\**" Pack="true" PackagePath="build\" />
+    <None Include="tools\**" Pack="true" PackagePath="tools\" />
+    <None Include="wit\**" Pack="true" PackagePath="wit\" />
+  </ItemGroup>
+
+</Project>

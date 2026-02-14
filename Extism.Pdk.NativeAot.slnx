@@ -1,0 +1,11 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/Extism.Pdk.NativeAot/Extism.Pdk.NativeAot.csproj" />
+    <Project Path="src/Extism.Pdk.SourceGenerator/Extism.Pdk.SourceGenerator.csproj" />
+  </Folder>
+  
+  <Folder Name="/samples/">
+    <Project Path="samples/extism-host-dotnet/ExtismHostExample.csproj" />
+    <Project Path="samples/extism-plugin-dotnet/ExtismPluginExample.csproj" />
+  </Folder>
+</Solution>

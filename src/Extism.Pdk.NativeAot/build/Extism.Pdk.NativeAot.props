@@ -1,0 +1,22 @@
+<Project>
+
+  <!-- NativeAOT WASM properties required by all Extism plugins -->
+  <PropertyGroup>
+    <RuntimeIdentifier>wasi-wasm</RuntimeIdentifier>
+    <UseAppHost>false</UseAppHost>
+    <PublishTrimmed>true</PublishTrimmed>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <MSBuildEnableWorkloadResolver>false</MSBuildEnableWorkloadResolver>
+    <SelfContained>true</SelfContained>
+  </PropertyGroup>
+
+  <!-- ILCompiler LLVM (cross-platform) -->
+  <ItemGroup>
+    <PackageReference Include="Microsoft.DotNet.ILCompiler.LLVM" Version="10.0.0-*" />
+    <PackageReference Include="runtime.win-x64.Microsoft.DotNet.ILCompiler.LLVM" Version="10.0.0-*" Condition="$([MSBuild]::IsOSPlatform('Windows'))" />
+    <PackageReference Include="runtime.linux-x64.Microsoft.DotNet.ILCompiler.LLVM" Version="10.0.0-*" Condition="$([MSBuild]::IsOSPlatform('Linux'))" />
+    <PackageReference Include="runtime.osx-x64.Microsoft.DotNet.ILCompiler.LLVM" Version="10.0.0-*" Condition="$([MSBuild]::IsOSPlatform('OSX'))" />
+  </ItemGroup>
+
+</Project>
