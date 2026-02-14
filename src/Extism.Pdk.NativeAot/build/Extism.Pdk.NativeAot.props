@@ -14,9 +14,7 @@
   <!-- ILCompiler LLVM (cross-platform) -->
   <ItemGroup>
     <PackageReference Include="Microsoft.DotNet.ILCompiler.LLVM" Version="10.0.0-*" />
-    <PackageReference Include="runtime.win-x64.Microsoft.DotNet.ILCompiler.LLVM" Version="10.0.0-*" Condition="$([MSBuild]::IsOSPlatform('Windows'))" />
-    <PackageReference Include="runtime.linux-x64.Microsoft.DotNet.ILCompiler.LLVM" Version="10.0.0-*" Condition="$([MSBuild]::IsOSPlatform('Linux'))" />
-    <PackageReference Include="runtime.osx-x64.Microsoft.DotNet.ILCompiler.LLVM" Version="10.0.0-*" Condition="$([MSBuild]::IsOSPlatform('OSX'))" />
+    <PackageReference Include="runtime.$(NETCoreSdkPortableRuntimeIdentifier).Microsoft.DotNet.ILCompiler.LLVM" Version="10.0.0-*" />
   </ItemGroup>
 
 </Project>
