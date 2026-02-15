@@ -14,7 +14,7 @@ The project has three main components:
 
 ## Prerequisites
 
-- [.NET 10 SDK](https://dotnet.microsoft.com/download/dotnet/10.0) (Preview)
+- [.NET 10 SDK](https://dotnet.microsoft.com/download/dotnet/10.0)
 - **Python 3.10+** — used by `clip.py` during post-publish
 - **wasm-tools** — the [Bytecode Alliance `wasm-tools`](https://github.com/bytecodealliance/wasm-tools) CLI (`wasm-tools component unbundle` and `wasm-tools parse` must be on your PATH)
 
