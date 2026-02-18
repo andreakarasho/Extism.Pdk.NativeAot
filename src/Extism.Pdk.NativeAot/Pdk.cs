@@ -4,27 +4,60 @@ namespace Extism.Pdk.NativeAot;
 
 public static class Pdk
 {
+    // Static grow-only buffer for zero-alloc input reads in steady state.
+    // Safe because WASM is single-threaded and exports are not reentrant.
+    private static byte[] s_inputBuffer = new byte[256];
+
+    /// <summary>
+    /// Reads input into a newly allocated byte array. Use when the caller needs ownership
+    /// of the returned data (e.g. byte[] parameter in user exports).
+    /// </summary>
     public static byte[] GetInput()
     {
         var len = Imports.extism_input_length();
         var buf = new byte[len];
+        LoadInputInto(buf.AsSpan(0, (int)len));
+        return buf;
+    }
+
+    /// <summary>
+    /// Reads input into a static reusable buffer and returns a span over the valid data.
+    /// The span is valid until the next call to GetInputSpan().
+    /// For APIs that require byte[], use <see cref="InputBufferArray"/> after calling this.
+    /// </summary>
+    public static Span<byte> GetInputSpan()
+    {
+        var len = (int)Imports.extism_input_length();
+        if (s_inputBuffer.Length < len)
+            s_inputBuffer = new byte[len];
+        LoadInputInto(s_inputBuffer.AsSpan(0, len));
+        return s_inputBuffer.AsSpan(0, len);
+    }
+
+    /// <summary>
+    /// The underlying array backing <see cref="GetInputSpan"/>.
+    /// Use for APIs that require byte[]. Only valid after calling GetInputSpan().
+    /// </summary>
+    public static byte[] InputBufferArray => s_inputBuffer;
+
+    public static int GetInputLength() => (int)Imports.extism_input_length();
+
+    public static void LoadInputInto(Span<byte> buf)
+    {
+        var len = (ulong)buf.Length;
         var chunks = len / 8;
 
         for (ulong i = 0; i < chunks; i++)
         {
             var val = Imports.extism_input_load_u64(i * 8);
-            BitConverter.TryWriteBytes(buf.AsSpan((int)(i * 8)), val);
+            BitConverter.TryWriteBytes(buf.Slice((int)(i * 8)), val);
         }
 
         for (var i = chunks * 8; i < len; i++)
         {
-            buf[i] = Imports.extism_input_load_u8(i);
+            buf[(int)i] = Imports.extism_input_load_u8(i);
         }
-
-        return buf;
     }
-
-    public static string GetInputString() => Encoding.UTF8.GetString(GetInput());
 
     /// <summary>
     /// Allocates Extism memory, copies <paramref name="data"/> into it, and sets the output.
@@ -34,6 +67,12 @@ public static class Pdk
         var block = Allocate(data);
         // Do not free — extism_output_set references this memory until the host reads it.
         Imports.extism_output_set(block.Offset, block.Length);
+    }
+
+    public static string GetInputString()
+    {
+        var input = GetInputSpan();
+        return Encoding.UTF8.GetString(input);
     }
 
     public static void SetOutput(string value) => SetOutput(Encoding.UTF8.GetBytes(value).AsSpan());
@@ -112,6 +151,9 @@ public static class Pdk
 
     public static void Log(LogLevel level, string message)
     {
+        if (level < (LogLevel)Imports.extism_get_log_level())
+            return;
+
         using var block = Allocate(message);
         switch (level)
         {

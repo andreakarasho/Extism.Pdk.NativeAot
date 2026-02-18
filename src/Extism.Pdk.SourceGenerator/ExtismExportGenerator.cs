@@ -374,6 +374,22 @@ namespace Extism.Pdk
         sb.AppendLine("internal static class __ExtismExports");
         sb.AppendLine("{");
 
+        bool hasFlatBufferInput = false;
+        foreach (var e in exports)
+        {
+            if (e.Parameters.Length == 1 && e.Parameters[0].Category == TypeCategory.FlatBuffer)
+            {
+                hasFlatBufferInput = true;
+                break;
+            }
+        }
+        if (hasFlatBufferInput)
+        {
+            sb.AppendLine("    private static byte[] __inputBBArray;");
+            sb.AppendLine("    private static global::Google.FlatBuffers.ByteBuffer __inputBB;");
+            sb.AppendLine();
+        }
+
         var seenNames = new HashSet<string>(StringComparer.Ordinal);
         bool any = false;
 
@@ -514,26 +530,42 @@ namespace Extism.Pdk
             {
                 case TypeCategory.String:
                     sb.AppendLine($"            var @{p.Name} = Pdk.GetInputString();");
-                    break;
+                    return;
                 case TypeCategory.ByteArray:
-                    sb.AppendLine($"            var @{p.Name} = Pdk.GetInput();");
-                    break;
+                    sb.AppendLine($"            var @{p.Name} = Pdk.GetInputSpan().ToArray();");
+                    return;
                 case TypeCategory.FlatBuffer:
                     var simpleName = GetSimpleTypeName(p.TypeFullName);
-                    sb.AppendLine("            var __input = Pdk.GetInput();");
-                    sb.AppendLine($"            var @{p.Name} = {p.TypeFullName}.GetRootAs{simpleName}(new global::Google.FlatBuffers.ByteBuffer(__input));");
-                    break;
+                    // Cached ByteBuffer — zero alloc in steady state; ByteBuffer tolerates trailing bytes
+                    sb.AppendLine("            Pdk.GetInputSpan();");
+                    sb.AppendLine("            if (__inputBBArray != Pdk.InputBufferArray)");
+                    sb.AppendLine("            {");
+                    sb.AppendLine("                __inputBBArray = Pdk.InputBufferArray;");
+                    sb.AppendLine("                __inputBB = new global::Google.FlatBuffers.ByteBuffer(__inputBBArray);");
+                    sb.AppendLine("            }");
+                    sb.AppendLine("            else { __inputBB.Reset(); }");
+                    sb.AppendLine($"            var @{p.Name} = {p.TypeFullName}.GetRootAs{simpleName}(__inputBB);");
+                    return;
                 default:
-                    // Single primitive
-                    sb.AppendLine("            var __input = Pdk.GetInput();");
+                {
+                    // Single primitive — stackalloc
+                    int size = GetPrimitiveSize(p.Category);
+                    sb.AppendLine($"            System.Span<byte> __input = stackalloc byte[{size}];");
+                    sb.AppendLine("            Pdk.LoadInputInto(__input);");
                     sb.AppendLine($"            var @{p.Name} = {GetPrimitiveReadExpr(p.Category, "__input", 0)};");
-                    break;
+                    return;
+                }
             }
         }
         else
         {
-            // Multiple params - all validated as primitives
-            sb.AppendLine("            var __input = Pdk.GetInput();");
+            // Multiple params - all primitives, compute total size for stackalloc
+            int totalSize = 0;
+            foreach (var p in export.Parameters)
+                totalSize += GetPrimitiveSize(p.Category);
+
+            sb.AppendLine($"            System.Span<byte> __input = stackalloc byte[{totalSize}];");
+            sb.AppendLine("            Pdk.LoadInputInto(__input);");
             int offset = 0;
             foreach (var p in export.Parameters)
             {
@@ -541,6 +573,7 @@ namespace Extism.Pdk
                 offset += GetPrimitiveSize(p.Category);
             }
         }
+
     }
 
     private static string GenerateArguments(ExportInfo export)
@@ -560,7 +593,7 @@ namespace Extism.Pdk
                 sb.AppendLine("            Pdk.SetOutput(__result);");
                 break;
             case TypeCategory.FlatBuffer:
-                sb.AppendLine("            Pdk.SetOutput(__result.ByteBuffer.ToSizedArray());");
+                sb.AppendLine("            Pdk.SetOutput(__result.ByteBuffer.ToSizedReadOnlySpan());");
                 break;
             case TypeCategory.Bool:
                 sb.AppendLine("            System.Span<byte> __output = stackalloc byte[1];");
@@ -600,7 +633,7 @@ namespace Extism.Pdk
             return $"{arrayVar}[{offset}]";
 
         // Multi-byte types: BinaryPrimitives
-        var spanExpr = offset == 0 ? arrayVar : $"{arrayVar}.AsSpan({offset})";
+        var spanExpr = offset == 0 ? arrayVar : $"{arrayVar}.Slice({offset})";
         return cat switch
         {
             TypeCategory.Int16 => $"BinaryPrimitives.ReadInt16LittleEndian({spanExpr})",
