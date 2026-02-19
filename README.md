@@ -2,7 +2,7 @@
 
 A Plugin Development Kit (PDK) for building [Extism](https://extism.org/) plugins in C# using .NET NativeAOT, compiled to WebAssembly.
 
-Write your plugin exports as regular C# methods, annotate them with `[ExtismExport]`, and the included source generator + MSBuild targets handle the rest — WIT generation, WASM compilation, component-model unbundling, and WASI stubbing.
+Write your plugin exports as regular C# methods, annotate them with `[ExtismExport]`, and the included source generator + MSBuild targets handle the rest — WIT generation, WASM compilation, component-model unbundling, and optional WASI stubbing.
 
 ## How It Works
 
@@ -10,7 +10,7 @@ The project has three main components:
 
 - **Extism.Pdk.NativeAot** — The PDK library. Provides the `Pdk` API (input/output, memory, config, variables, logging, HTTP) and MSBuild integration that automatically configures NativeAOT-to-WASM compilation.
 - **Extism.Pdk.SourceGenerator** — A Roslyn source generator that finds `[ExtismExport("name")]` attributes and generates the `UnmanagedCallersOnly` wrapper functions, handling serialization/deserialization of strings, byte arrays, primitives, multi-parameter packing, and FlatBuffers types.
-- **clip.py** — A post-publish tool that strips the WASM Component Model wrapper, stubs WASI imports, and converts namespaces so the resulting `.wasm` file is a bare module compatible with the Extism runtime.
+- **clip.py** — A post-publish tool that strips the WASM Component Model wrapper, optionally stubs WASI imports, and converts namespaces so the resulting `.wasm` file is a bare module compatible with the Extism runtime.
 
 ## Prerequisites
 
@@ -25,6 +25,24 @@ dotnet publish samples/extism-plugin-dotnet/ExtismPluginExample.csproj -c Releas
 ```
 
 This compiles the plugin to WASM via NativeAOT, then automatically runs `clip.py` to produce the final `ExtismPluginExample_clipped.wasm`.
+
+To keep `wasi:*` imports in the clipped output, set this in your plugin `.csproj`:
+
+```xml
+<PropertyGroup>
+  <ExtismClipKeepWasiImports>true</ExtismClipKeepWasiImports>
+</PropertyGroup>
+```
+
+To keep stubbing enabled but bridge key WASI P2 calls through `wasi_snapshot_preview1`
+imports (including random/clock/exit, basic stdio handles, and preopen directory
+enumeration), set:
+
+```xml
+<PropertyGroup>
+  <ExtismClipWasiP1Bridge>true</ExtismClipWasiP1Bridge>
+</PropertyGroup>
+```
 
 ## Running the Sample Host
 

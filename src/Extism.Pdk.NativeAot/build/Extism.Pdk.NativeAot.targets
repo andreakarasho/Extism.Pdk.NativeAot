@@ -76,14 +76,18 @@ if (ExportsFound)
     </ItemGroup>
   </Target>
 
-  <!-- Post-publish: unbundle component model, stub WASI imports, convert namespaces -->
+  <!-- Post-publish: unbundle component model, optionally stub WASI imports, convert namespaces -->
   <Target Name="ClipWasm" AfterTargets="Publish" Condition="'$(RuntimeIdentifier)' == 'wasi-wasm'">
     <PropertyGroup>
       <_NativeDir>bin/$(Configuration)/$(TargetFramework)/$(RuntimeIdentifier)/native</_NativeDir>
       <_ClipScript>$(_ExtismPdkRoot)tools\clip.py</_ClipScript>
       <_WasmFile>$(_NativeDir)/$(AssemblyName).wasm</_WasmFile>
+      <ExtismClipKeepWasiImports Condition="'$(ExtismClipKeepWasiImports)' == ''">false</ExtismClipKeepWasiImports>
+      <ExtismClipWasiP1Bridge Condition="'$(ExtismClipWasiP1Bridge)' == ''">true</ExtismClipWasiP1Bridge>
+      <_KeepWasiImportsArg Condition="'$(ExtismClipKeepWasiImports)' == 'true'">--keep-wasi-imports</_KeepWasiImportsArg>
+      <_WasiP1BridgeArg Condition="'$(ExtismClipWasiP1Bridge)' == 'true'">--wasi-p1-bridge</_WasiP1BridgeArg>
     </PropertyGroup>
-    <Exec Command="python &quot;$(_ClipScript)&quot; --namespaces env,debug,extism:host/env,extism:host/user &quot;$(_WasmFile)&quot; &quot;$(_NativeDir)/$(AssemblyName)_clipped.wasm&quot;" />
+    <Exec Command="python &quot;$(_ClipScript)&quot; --namespaces env,debug,extism:host/env,extism:host/user $(_KeepWasiImportsArg) $(_WasiP1BridgeArg) &quot;$(_WasmFile)&quot; &quot;$(_NativeDir)/$(AssemblyName)_clipped.wasm&quot;" />
     <Message Importance="High" Text="Clipped WASM written to $(_NativeDir)/$(AssemblyName)_clipped.wasm" />
   </Target>
 
