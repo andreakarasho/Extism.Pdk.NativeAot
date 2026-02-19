@@ -2,7 +2,7 @@
 Clips a component-encumbered WASM module down to a bare module.
 
 Runs `wasm-tools component unbundle` to strip the Component Model wrapper,
-converts to WAT, stubs WASI imports, converts namespaces, and compiles back to WASM.
+converts to WAT, optionally stubs WASI imports, converts namespaces, and compiles back to WASM.
 
 Based on the original clip.lua by Pspritechologist.
 
@@ -133,19 +133,1041 @@ def stub_import(content: str, ns_pattern: str, func_name: str, repl_instr: str |
     return content
 
 
-def perform_wasi_stubbing(content: str) -> str:
-    """Replace WASI 0.2.0 imports with stub function definitions."""
+def ensure_func_import(content: str, module: str, name: str, func_decl: str) -> str:
+    """Ensure a core wasm import exists; if missing, insert it before table/memory/func declarations."""
+    marker = f'(import "{module}" "{name}"'
+    if marker in content:
+        return content
+
+    insertion = f'  (import "{module}" "{name}" {func_decl})\n'
+
+    # Prefer placing new imports before the first WASI import. Those WASI
+    # imports are typically replaced with local shim funcs later in this pass.
+    first_wasi_import = re.search(r'^  \(import "wasi:[^"]+"', content, re.MULTILINE)
+    if first_wasi_import is not None:
+        insert_at = first_wasi_import.start()
+        prefix = '\n' if insert_at > 0 and content[insert_at - 1] != '\n' else ''
+        return content[:insert_at] + prefix + insertion + content[insert_at:]
+
+    # Otherwise place new imports directly after the top-level import block.
+    insert_at = -1
+    last_import_start = None
+    first_non_type_or_import = None
+    decl_pat = re.compile(r'^  \((\w+)\b', re.MULTILINE)
+    for match in decl_pat.finditer(content):
+        kind = match.group(1)
+        if kind == 'type':
+            continue
+        if kind == 'import':
+            last_import_start = match.start() + 2  # skip leading two spaces
+            continue
+        first_non_type_or_import = match.start()
+        break
+
+    if last_import_start is not None:
+        insert_at = find_balanced_parens(content, last_import_start)
+    elif first_non_type_or_import is not None:
+        insert_at = first_non_type_or_import
+
+    if insert_at < 0:
+        insert_at = content.find('\n  (table ')
+    if insert_at < 0:
+        insert_at = content.find('\n  (memory ')
+    if insert_at < 0:
+        insert_at = content.find('\n  (func ')
+    if insert_at < 0:
+        raise RuntimeError('Could not find insertion point for extra wasm imports.')
+
+    prefix = '\n' if insert_at > 0 and content[insert_at - 1] != '\n' else ''
+    return content[:insert_at] + prefix + insertion + content[insert_at:]
+
+
+# Bridge instruction for get-random-bytes: func(len: u64) -> list<u8>
+# Canonical ABI lowering: (param i64 i32) — len + retptr, writes {ptr:i32, len:i32} to retptr
+# Allocates a buffer via cabi_realloc and returns it as a list (bytes are heap-residue,
+# sufficient for hash code seeding and other non-cryptographic uses).
+_RANDOM_GET_BYTES_BRIDGE = (
+    '(local i32 i32)\n'
+    '    local.get 0\n'
+    '    i32.wrap_i64\n'
+    '    local.set 2\n'
+    '    i32.const 0\n'
+    '    i32.const 0\n'
+    '    i32.const 1\n'
+    '    local.get 2\n'
+    '    call $cabi_realloc\n'
+    '    local.set 3\n'
+    '    local.get 1\n'
+    '    local.get 3\n'
+    '    i32.store\n'
+    '    local.get 1\n'
+    '    local.get 2\n'
+    '    i32.store offset=4'
+)
+
+
+# Bridge get-random-bytes to WASI Preview 1 random_get:
+# - allocates an output buffer via cabi_realloc
+# - fills it via wasi_snapshot_preview1.random_get
+# - returns list ptr/len via canonical ABI outparam
+_RANDOM_GET_BYTES_BRIDGE_P1 = (
+    '(local i32 i32 i32)\n'
+    '    local.get 0\n'
+    '    i32.wrap_i64\n'
+    '    local.set 2\n'
+    '    i32.const 0\n'
+    '    i32.const 0\n'
+    '    i32.const 1\n'
+    '    local.get 2\n'
+    '    call $cabi_realloc\n'
+    '    local.set 3\n'
+    '    local.get 3\n'
+    '    local.get 2\n'
+    '    call $__wasi_snapshot_preview1_random_get\n'
+    '    local.set 4\n'
+    '    local.get 1\n'
+    '    local.get 3\n'
+    '    i32.store\n'
+    '    local.get 1\n'
+    '    local.get 2\n'
+    '    i32.store offset=4'
+)
+
+
+# Bridge monotonic now() -> wasi_snapshot_preview1.clock_time_get(CLOCK_MONOTONIC=1)
+_MONOTONIC_NOW_BRIDGE_P1 = (
+    '(local i32)\n'
+    '    i32.const 0\n'
+    '    i32.const 0\n'
+    '    i32.const 1\n'
+    '    i32.const 8\n'
+    '    call $cabi_realloc\n'
+    '    local.set 0\n'
+    '    i32.const 1\n'
+    '    i64.const 0\n'
+    '    local.get 0\n'
+    '    call $__wasi_snapshot_preview1_clock_time_get\n'
+    '    drop\n'
+    '    local.get 0\n'
+    '    i64.load'
+)
+
+
+# Bridge wall-clock now() -> wasi_snapshot_preview1.clock_time_get(CLOCK_REALTIME=0)
+# and lower timestamp(ns) to datetime { seconds: u64, nanoseconds: u32 }.
+_WALL_CLOCK_NOW_BRIDGE_P1 = (
+    '(local i32 i64)\n'
+    '    i32.const 0\n'
+    '    i32.const 0\n'
+    '    i32.const 1\n'
+    '    i32.const 8\n'
+    '    call $cabi_realloc\n'
+    '    local.set 1\n'
+    '    i32.const 0\n'
+    '    i64.const 0\n'
+    '    local.get 1\n'
+    '    call $__wasi_snapshot_preview1_clock_time_get\n'
+    '    drop\n'
+    '    local.get 1\n'
+    '    i64.load\n'
+    '    local.set 2\n'
+    '    local.get 0\n'
+    '    local.get 2\n'
+    '    i64.const 1000000000\n'
+    '    i64.div_u\n'
+    '    i64.store\n'
+    '    local.get 0\n'
+    '    local.get 2\n'
+    '    i64.const 1000000000\n'
+    '    i64.rem_u\n'
+    '    i32.wrap_i64\n'
+    '    i32.store offset=8'
+)
+
+
+# Bridge filesystem preopens list via WASI Preview 1:
+# enumerate preopened fds and return list<tuple<descriptor, string>>.
+_GET_DIRECTORIES_BRIDGE_P1 = (
+    '(local i32 i32 i32 i32 i32 i32 i32)\n'
+    '    i32.const 0\n'
+    '    i32.const 0\n'
+    '    i32.const 1\n'
+    '    i32.const 8\n'
+    '    call $cabi_realloc\n'
+    '    local.set 4\n'
+    '    i32.const 3\n'
+    '    local.set 3\n'
+    '    block\n'
+    '      loop\n'
+    '        local.get 3\n'
+    '        i32.const 64\n'
+    '        i32.gt_u\n'
+    '        br_if 1\n'
+    '        local.get 3\n'
+    '        local.get 4\n'
+    '        call $__wasi_snapshot_preview1_fd_prestat_get\n'
+    '        i32.eqz\n'
+    '        if\n'
+    '          local.get 4\n'
+    '          i32.load offset=4\n'
+    '          local.set 5\n'
+    '          local.get 5\n'
+    '          i32.eqz\n'
+    '          if\n'
+    '          else\n'
+    '            i32.const 0\n'
+    '            i32.const 0\n'
+    '            i32.const 1\n'
+    '            local.get 5\n'
+    '            call $cabi_realloc\n'
+    '            local.set 6\n'
+    '            local.get 3\n'
+    '            local.get 6\n'
+    '            local.get 5\n'
+    '            call $__wasi_snapshot_preview1_fd_prestat_dir_name\n'
+    '            i32.eqz\n'
+    '            if\n'
+    '              local.get 1\n'
+    '              local.get 2\n'
+    '              i32.const 12\n'
+    '              i32.mul\n'
+    '              i32.const 4\n'
+    '              local.get 2\n'
+    '              i32.const 1\n'
+    '              i32.add\n'
+    '              i32.const 12\n'
+    '              i32.mul\n'
+    '              call $cabi_realloc\n'
+    '              local.set 1\n'
+    '              local.get 1\n'
+    '              local.get 2\n'
+    '              i32.const 12\n'
+    '              i32.mul\n'
+    '              i32.add\n'
+    '              local.set 7\n'
+    '              local.get 7\n'
+    '              local.get 3\n'
+    '              i32.store\n'
+    '              local.get 7\n'
+    '              local.get 6\n'
+    '              i32.store offset=4\n'
+    '              local.get 7\n'
+    '              local.get 5\n'
+    '              i32.store offset=8\n'
+    '              local.get 2\n'
+    '              i32.const 1\n'
+    '              i32.add\n'
+    '              local.set 2\n'
+    '            else\n'
+    '              local.get 6\n'
+    '              local.get 5\n'
+    '              i32.const 1\n'
+    '              i32.const 0\n'
+    '              call $cabi_realloc\n'
+    '              drop\n'
+    '            end\n'
+    '          end\n'
+    '        end\n'
+    '        local.get 3\n'
+    '        i32.const 1\n'
+    '        i32.add\n'
+    '        local.set 3\n'
+    '        br 0\n'
+    '      end\n'
+    '    end\n'
+    '    local.get 0\n'
+    '    local.get 1\n'
+    '    i32.store\n'
+    '    local.get 0\n'
+    '    local.get 2\n'
+    '    i32.store offset=4'
+)
+
+
+# Bridge filesystem descriptor.read-directory:
+# returns a synthetic directory-entry-stream handle that stores {fd:i32, cookie:u64}.
+_READ_DIRECTORY_BRIDGE_P1 = (
+    '(local i32)\n'
+    '    i32.const 0\n'
+    '    i32.const 0\n'
+    '    i32.const 4\n'
+    '    i32.const 16\n'
+    '    call $cabi_realloc\n'
+    '    local.set 2\n'
+    '    local.get 2\n'
+    '    local.get 0\n'
+    '    i32.store\n'
+    '    local.get 2\n'
+    '    i64.const 0\n'
+    '    i64.store offset=4 align=4\n'
+    '    local.get 2\n'
+    '    i32.const 0\n'
+    '    i32.store offset=12\n'
+    '    local.get 1\n'
+    '    i32.const 0\n'
+    '    i32.store8\n'
+    '    local.get 1\n'
+    '    local.get 2\n'
+    '    i32.store offset=4'
+)
+
+
+# Bridge filesystem directory-entry-stream.read-directory-entry:
+# uses wasi_snapshot_preview1.fd_readdir and per-stream cookie state.
+_READ_DIRECTORY_ENTRY_BRIDGE_P1 = (
+    '(local i32 i32 i32 i32 i32 i32 i32 i32 i64 i32 i32 i32)\n'
+    '    i32.const 0\n'
+    '    i32.const 0\n'
+    '    i32.const 1\n'
+    '    i32.const 4096\n'
+    '    call $cabi_realloc\n'
+    '    local.set 2\n'
+    '    i32.const 0\n'
+    '    i32.const 0\n'
+    '    i32.const 4\n'
+    '    i32.const 4\n'
+    '    call $cabi_realloc\n'
+    '    local.set 3\n'
+    '    local.get 0\n'
+    '    i32.load\n'
+    '    local.get 2\n'
+    '    i32.const 4096\n'
+    '    local.get 0\n'
+    '    i64.load offset=4 align=4\n'
+    '    local.get 3\n'
+    '    call $__wasi_snapshot_preview1_fd_readdir\n'
+    '    local.set 4\n'
+    '    local.get 4\n'
+    '    i32.eqz\n'
+    '    if\n'
+    '    else\n'
+    '      local.get 1\n'
+    '      i32.const 1\n'
+    '      i32.store8\n'
+    '      local.get 1\n'
+    '      local.get 4\n'
+    '      i32.store8 offset=4\n'
+    '      local.get 2\n'
+    '      i32.const 4096\n'
+    '      i32.const 1\n'
+    '      i32.const 0\n'
+    '      call $cabi_realloc\n'
+    '      drop\n'
+    '      local.get 3\n'
+    '      i32.const 4\n'
+    '      i32.const 4\n'
+    '      i32.const 0\n'
+    '      call $cabi_realloc\n'
+    '      drop\n'
+    '      return\n'
+    '    end\n'
+    '    local.get 3\n'
+    '    i32.load\n'
+    '    local.set 5\n'
+    '    local.get 5\n'
+    '    i32.eqz\n'
+    '    if\n'
+    '      local.get 1\n'
+    '      i32.const 0\n'
+    '      i32.store8\n'
+    '      local.get 1\n'
+    '      i32.const 0\n'
+    '      i32.store8 offset=4\n'
+    '      local.get 2\n'
+    '      i32.const 4096\n'
+    '      i32.const 1\n'
+    '      i32.const 0\n'
+    '      call $cabi_realloc\n'
+    '      drop\n'
+    '      local.get 3\n'
+    '      i32.const 4\n'
+    '      i32.const 4\n'
+    '      i32.const 0\n'
+    '      call $cabi_realloc\n'
+    '      drop\n'
+    '      return\n'
+    '    end\n'
+    '    i32.const 0\n'
+    '    local.set 6\n'
+    '    block\n'
+    '      loop\n'
+    '        local.get 6\n'
+    '        local.get 5\n'
+    '        i32.ge_u\n'
+    '        br_if 1\n'
+    '        local.get 6\n'
+    '        i32.const 24\n'
+    '        i32.add\n'
+    '        local.get 5\n'
+    '        i32.gt_u\n'
+    '        br_if 1\n'
+    '        local.get 2\n'
+    '        local.get 6\n'
+    '        i32.add\n'
+    '        local.set 7\n'
+    '        local.get 7\n'
+    '        i32.load offset=16\n'
+    '        local.set 8\n'
+    '        i32.const 24\n'
+    '        local.get 8\n'
+    '        i32.add\n'
+    '        local.set 9\n'
+    '        local.get 6\n'
+    '        local.get 9\n'
+    '        i32.add\n'
+    '        local.get 5\n'
+    '        i32.gt_u\n'
+    '        br_if 1\n'
+    '        local.get 7\n'
+    '        i64.load\n'
+    '        local.set 10\n'
+    '        local.get 7\n'
+    '        i32.const 24\n'
+    '        i32.add\n'
+    '        local.set 11\n'
+    '        local.get 6\n'
+    '        local.get 9\n'
+    '        i32.add\n'
+    '        local.set 6\n'
+    '        local.get 0\n'
+    '        local.get 10\n'
+    '        i64.store offset=4 align=4\n'
+    '        local.get 0\n'
+    '        i32.load offset=12\n'
+    '        local.set 4\n'
+    '        local.get 4\n'
+    '        i32.const 2\n'
+    '        i32.lt_u\n'
+    '        if\n'
+    '          local.get 0\n'
+    '          local.get 4\n'
+    '          i32.const 1\n'
+    '          i32.add\n'
+    '          i32.store offset=12\n'
+    '          br 0\n'
+    '        end\n'
+    '        local.get 8\n'
+    '        i32.eqz\n'
+    '        if\n'
+    '          br 0\n'
+    '        end\n'
+    '        local.get 8\n'
+    '        i32.const 1\n'
+    '        i32.eq\n'
+    '        if\n'
+    '          local.get 11\n'
+    '          i32.load8_u\n'
+    '          i32.const 46\n'
+    '          i32.eq\n'
+    '          if\n'
+    '            br 0\n'
+    '          end\n'
+    '        end\n'
+    '        local.get 8\n'
+    '        i32.const 2\n'
+    '        i32.eq\n'
+    '        if\n'
+    '          local.get 11\n'
+    '          i32.load8_u\n'
+    '          i32.const 46\n'
+    '          i32.eq\n'
+    '          local.get 11\n'
+    '          i32.const 1\n'
+    '          i32.add\n'
+    '          i32.load8_u\n'
+    '          i32.const 46\n'
+    '          i32.eq\n'
+    '          i32.and\n'
+    '          if\n'
+    '            br 0\n'
+    '          end\n'
+    '        end\n'
+    '        i32.const 0\n'
+    '        i32.const 0\n'
+    '        i32.const 1\n'
+    '        local.get 8\n'
+    '        call $cabi_realloc\n'
+    '        local.set 12\n'
+    '        local.get 8\n'
+    '        i32.eqz\n'
+    '        if\n'
+    '        else\n'
+    '          local.get 12\n'
+    '          local.get 11\n'
+    '          local.get 8\n'
+    '          memory.copy\n'
+    '        end\n'
+    '        i32.const 0\n'
+    '        local.set 13\n'
+    '        local.get 7\n'
+    '        i32.load8_u offset=20\n'
+    '        local.set 4\n'
+    '        local.get 4\n'
+    '        i32.const 1\n'
+    '        i32.eq\n'
+    '        if\n'
+    '          i32.const 1\n'
+    '          local.set 13\n'
+    '        else\n'
+    '          local.get 4\n'
+    '          i32.const 2\n'
+    '          i32.eq\n'
+    '          if\n'
+    '            i32.const 2\n'
+    '            local.set 13\n'
+    '          else\n'
+    '            local.get 4\n'
+    '            i32.const 3\n'
+    '            i32.eq\n'
+    '            if\n'
+    '              i32.const 3\n'
+    '              local.set 13\n'
+    '            else\n'
+    '              local.get 4\n'
+    '              i32.const 4\n'
+    '              i32.eq\n'
+    '              if\n'
+    '                i32.const 6\n'
+    '                local.set 13\n'
+    '              else\n'
+    '                local.get 4\n'
+    '                i32.const 5\n'
+    '                i32.eq\n'
+    '                local.get 4\n'
+    '                i32.const 6\n'
+    '                i32.eq\n'
+    '                i32.or\n'
+    '                if\n'
+    '                  i32.const 7\n'
+    '                  local.set 13\n'
+    '                else\n'
+    '                  local.get 4\n'
+    '                  i32.const 7\n'
+    '                  i32.eq\n'
+    '                  if\n'
+    '                    i32.const 5\n'
+    '                    local.set 13\n'
+    '                  end\n'
+    '                end\n'
+    '              end\n'
+    '            end\n'
+    '          end\n'
+    '        end\n'
+    '        local.get 1\n'
+    '        i32.const 0\n'
+    '        i32.store8\n'
+    '        local.get 1\n'
+    '        i32.const 1\n'
+    '        i32.store8 offset=4\n'
+    '        local.get 1\n'
+    '        local.get 13\n'
+    '        i32.store8 offset=8\n'
+    '        local.get 1\n'
+    '        local.get 12\n'
+    '        i32.store offset=12\n'
+    '        local.get 1\n'
+    '        local.get 8\n'
+    '        i32.store offset=16\n'
+    '        local.get 2\n'
+    '        i32.const 4096\n'
+    '        i32.const 1\n'
+    '        i32.const 0\n'
+    '        call $cabi_realloc\n'
+    '        drop\n'
+    '        local.get 3\n'
+    '        i32.const 4\n'
+    '        i32.const 4\n'
+    '        i32.const 0\n'
+    '        call $cabi_realloc\n'
+    '        drop\n'
+    '        return\n'
+    '      end\n'
+    '    end\n'
+    '    local.get 1\n'
+    '    i32.const 0\n'
+    '    i32.store8\n'
+    '    local.get 1\n'
+    '    i32.const 0\n'
+    '    i32.store8 offset=4\n'
+    '    local.get 2\n'
+    '    i32.const 4096\n'
+    '    i32.const 1\n'
+    '    i32.const 0\n'
+    '    call $cabi_realloc\n'
+    '    drop\n'
+    '    local.get 3\n'
+    '    i32.const 4\n'
+    '    i32.const 4\n'
+    '    i32.const 0\n'
+    '    call $cabi_realloc\n'
+    '    drop'
+)
+
+# Bridge directory-entry-stream drop to release synthetic stream state.
+_DIRECTORY_ENTRY_STREAM_DROP_BRIDGE_P1 = (
+    'local.get 0\n'
+    '    i32.eqz\n'
+    '    if\n'
+    '    else\n'
+    '      local.get 0\n'
+    '      i32.const 16\n'
+    '      i32.const 4\n'
+    '      i32.const 0\n'
+    '      call $cabi_realloc\n'
+    '      drop\n'
+    '    end'
+)
+
+
+# Bridge descriptor.open-at to WASI Preview 1 path_open.
+_OPEN_AT_BRIDGE_P1 = (
+    '(local i32 i32)\n'
+    '    i32.const 0\n'
+    '    i32.const 0\n'
+    '    i32.const 4\n'
+    '    i32.const 4\n'
+    '    call $cabi_realloc\n'
+    '    local.set 7\n'
+    '    local.get 0\n'
+    '    local.get 1\n'
+    '    local.get 2\n'
+    '    local.get 3\n'
+    '    local.get 4\n'
+    '    i64.const 2383874\n'
+    '    i64.const 2383874\n'
+    '    i32.const 0\n'
+    '    local.get 7\n'
+    '    call $__wasi_snapshot_preview1_path_open\n'
+    '    local.set 8\n'
+    '    local.get 8\n'
+    '    i32.eqz\n'
+    '    if\n'
+    '      local.get 6\n'
+    '      i32.const 0\n'
+    '      i32.store8\n'
+    '      local.get 6\n'
+    '      local.get 7\n'
+    '      i32.load\n'
+    '      i32.store offset=4\n'
+    '    else\n'
+    '      local.get 6\n'
+    '      i32.const 1\n'
+    '      i32.store8\n'
+    '      local.get 6\n'
+    '      local.get 8\n'
+    '      i32.store8 offset=4\n'
+    '    end\n'
+    '    local.get 7\n'
+    '    i32.const 4\n'
+    '    i32.const 4\n'
+    '    i32.const 0\n'
+    '    call $cabi_realloc\n'
+    '    drop'
+)
+
+
+# Bridge descriptor.get-flags to a deterministic empty-flags success.
+_GET_FLAGS_BRIDGE_P1 = (
+    'local.get 1\n'
+    '    i32.const 0\n'
+    '    i32.store8\n'
+    '    local.get 1\n'
+    '    i32.const 0\n'
+    '    i32.store8 offset=1'
+)
+
+
+# Bridge descriptor.metadata-hash to WASI Preview 1 fd_filestat_get.
+_METADATA_HASH_BRIDGE_P1 = (
+    '(local i32 i32)\n'
+    '    i32.const 0\n'
+    '    i32.const 0\n'
+    '    i32.const 8\n'
+    '    i32.const 64\n'
+    '    call $cabi_realloc\n'
+    '    local.set 2\n'
+    '    local.get 0\n'
+    '    local.get 2\n'
+    '    call $__wasi_snapshot_preview1_fd_filestat_get\n'
+    '    local.set 3\n'
+    '    local.get 3\n'
+    '    i32.eqz\n'
+    '    if\n'
+    '      local.get 1\n'
+    '      i32.const 0\n'
+    '      i32.store8\n'
+    '      local.get 1\n'
+    '      local.get 2\n'
+    '      i64.load\n'
+    '      i64.store offset=8\n'
+    '      local.get 1\n'
+    '      local.get 2\n'
+    '      i64.load offset=8\n'
+    '      i64.store offset=16\n'
+    '    else\n'
+    '      local.get 1\n'
+    '      i32.const 0\n'
+    '      i32.store8\n'
+    '      local.get 1\n'
+    '      i64.const 0\n'
+    '      i64.store offset=8\n'
+    '      local.get 1\n'
+    '      i64.const 0\n'
+    '      i64.store offset=16\n'
+    '    end\n'
+    '    local.get 2\n'
+    '    i32.const 64\n'
+    '    i32.const 8\n'
+    '    i32.const 0\n'
+    '    call $cabi_realloc\n'
+    '    drop'
+)
+
+
+# Bridge descriptor.metadata-hash-at to WASI Preview 1 path_filestat_get.
+_METADATA_HASH_AT_BRIDGE_P1 = (
+    '(local i32 i32)\n'
+    '    i32.const 0\n'
+    '    i32.const 0\n'
+    '    i32.const 8\n'
+    '    i32.const 64\n'
+    '    call $cabi_realloc\n'
+    '    local.set 5\n'
+    '    local.get 0\n'
+    '    local.get 1\n'
+    '    local.get 2\n'
+    '    local.get 3\n'
+    '    local.get 5\n'
+    '    call $__wasi_snapshot_preview1_path_filestat_get\n'
+    '    local.set 6\n'
+    '    local.get 6\n'
+    '    i32.eqz\n'
+    '    if\n'
+    '      local.get 4\n'
+    '      i32.const 0\n'
+    '      i32.store8\n'
+    '      local.get 4\n'
+    '      local.get 5\n'
+    '      i64.load\n'
+    '      i64.store offset=8\n'
+    '      local.get 4\n'
+    '      local.get 5\n'
+    '      i64.load offset=8\n'
+    '      i64.store offset=16\n'
+    '    else\n'
+    '      local.get 4\n'
+    '      i32.const 0\n'
+    '      i32.store8\n'
+    '      local.get 4\n'
+    '      i64.const 0\n'
+    '      i64.store offset=8\n'
+    '      local.get 4\n'
+    '      i64.const 0\n'
+    '      i64.store offset=16\n'
+    '    end\n'
+    '    local.get 5\n'
+    '    i32.const 64\n'
+    '    i32.const 8\n'
+    '    i32.const 0\n'
+    '    call $cabi_realloc\n'
+    '    drop'
+)
+
+
+# Bridge descriptor.stat to WASI Preview 1 fd_filestat_get.
+_STAT_BRIDGE_P1 = (
+    '(local i32 i32)\n'
+    '    i32.const 0\n'
+    '    i32.const 0\n'
+    '    i32.const 8\n'
+    '    i32.const 64\n'
+    '    call $cabi_realloc\n'
+    '    local.set 2\n'
+    '    local.get 0\n'
+    '    local.get 2\n'
+    '    call $__wasi_snapshot_preview1_fd_filestat_get\n'
+    '    local.set 3\n'
+    '    local.get 3\n'
+    '    i32.eqz\n'
+    '    if\n'
+    '      local.get 1\n'
+    '      i32.const 0\n'
+    '      i32.store8\n'
+    '      local.get 1\n'
+    '      local.get 2\n'
+    '      i32.load8_u offset=16\n'
+    '      i32.store8 offset=8\n'
+    '      local.get 1\n'
+    '      local.get 2\n'
+    '      i64.load\n'
+    '      i64.store offset=16\n'
+    '      local.get 1\n'
+    '      local.get 2\n'
+    '      i64.load offset=8\n'
+    '      i64.store offset=24\n'
+    '      local.get 1\n'
+    '      i32.const 0\n'
+    '      i32.store8 offset=32\n'
+    '      local.get 1\n'
+    '      i32.const 0\n'
+    '      i32.store8 offset=56\n'
+    '      local.get 1\n'
+    '      i32.const 0\n'
+    '      i32.store8 offset=80\n'
+    '    else\n'
+    '      local.get 1\n'
+    '      i32.const 0\n'
+    '      i32.store8\n'
+    '      local.get 1\n'
+    '      i32.const 3\n'
+    '      i32.store8 offset=8\n'
+    '      local.get 1\n'
+    '      i64.const 0\n'
+    '      i64.store offset=16\n'
+    '      local.get 1\n'
+    '      i64.const 0\n'
+    '      i64.store offset=24\n'
+    '      local.get 1\n'
+    '      i32.const 0\n'
+    '      i32.store8 offset=32\n'
+    '      local.get 1\n'
+    '      i32.const 0\n'
+    '      i32.store8 offset=56\n'
+    '      local.get 1\n'
+    '      i32.const 0\n'
+    '      i32.store8 offset=80\n'
+    '    end\n'
+    '    local.get 2\n'
+    '    i32.const 64\n'
+    '    i32.const 8\n'
+    '    i32.const 0\n'
+    '    call $cabi_realloc\n'
+    '    drop'
+)
+
+
+# Bridge descriptor.stat-at to WASI Preview 1 path_filestat_get.
+_STAT_AT_BRIDGE_P1 = (
+    '(local i32 i32)\n'
+    '    i32.const 0\n'
+    '    i32.const 0\n'
+    '    i32.const 8\n'
+    '    i32.const 64\n'
+    '    call $cabi_realloc\n'
+    '    local.set 5\n'
+    '    local.get 0\n'
+    '    local.get 1\n'
+    '    local.get 2\n'
+    '    local.get 3\n'
+    '    local.get 5\n'
+    '    call $__wasi_snapshot_preview1_path_filestat_get\n'
+    '    local.set 6\n'
+    '    local.get 6\n'
+    '    i32.eqz\n'
+    '    if\n'
+    '      local.get 4\n'
+    '      i32.const 0\n'
+    '      i32.store8\n'
+    '      local.get 4\n'
+    '      local.get 5\n'
+    '      i32.load8_u offset=16\n'
+    '      i32.store8 offset=8\n'
+    '      local.get 4\n'
+    '      local.get 5\n'
+    '      i64.load\n'
+    '      i64.store offset=16\n'
+    '      local.get 4\n'
+    '      local.get 5\n'
+    '      i64.load offset=8\n'
+    '      i64.store offset=24\n'
+    '      local.get 4\n'
+    '      i32.const 0\n'
+    '      i32.store8 offset=32\n'
+    '      local.get 4\n'
+    '      i32.const 0\n'
+    '      i32.store8 offset=56\n'
+    '      local.get 4\n'
+    '      i32.const 0\n'
+    '      i32.store8 offset=80\n'
+    '    else\n'
+    '      local.get 4\n'
+    '      i32.const 0\n'
+    '      i32.store8\n'
+    '      local.get 4\n'
+    '      i32.const 3\n'
+    '      i32.store8 offset=8\n'
+    '      local.get 4\n'
+    '      i64.const 0\n'
+    '      i64.store offset=16\n'
+    '      local.get 4\n'
+    '      i64.const 0\n'
+    '      i64.store offset=24\n'
+    '      local.get 4\n'
+    '      i32.const 0\n'
+    '      i32.store8 offset=32\n'
+    '      local.get 4\n'
+    '      i32.const 0\n'
+    '      i32.store8 offset=56\n'
+    '      local.get 4\n'
+    '      i32.const 0\n'
+    '      i32.store8 offset=80\n'
+    '    end\n'
+    '    local.get 5\n'
+    '    i32.const 64\n'
+    '    i32.const 8\n'
+    '    i32.const 0\n'
+    '    call $cabi_realloc\n'
+    '    drop'
+)
+
+
+# Bridge wasi:cli/exit exit() -> wasi_snapshot_preview1.proc_exit()
+_EXIT_BRIDGE_P1 = (
+    'local.get 0\n'
+    '    call $__wasi_snapshot_preview1_proc_exit\n'
+    '    unreachable'
+)
+
+
+def perform_wasi_stubbing(
+    content: str,
+    stub_wasi: bool = True,
+    stub_env: bool = True,
+    use_wasi_p1_bridge: bool = False,
+) -> str:
+    """Replace selected imports with stub function definitions.
+
+    If `stub_wasi` is true, WASI 0.2.0 imports are stubbed with safe defaults.
+    Special cases:
+    - get-random-bytes: bridges via cabi_realloc to return a valid list<u8>
+      (prevents crashes in .NET runtime hash code / ArrayPool initialization)
+    - exit: uses unreachable (exit should never return)
+
+    If `stub_env` is true, remaining `env` imports are also stubbed.
+    If `use_wasi_p1_bridge` is true, selected WASI P2 shims call
+    `wasi_snapshot_preview1` functions instead of no-op/unreachable stubs.
+    """
+    if not stub_wasi:
+        if not stub_env:
+            return content
+
+        env_pattern = re.compile(r'\(\s*import\s*"(env)"\s*"([^"]+)"')
+        while True:
+            match = env_pattern.search(content)
+            if not match:
+                break
+            ns_raw, func_name = match.group(1), match.group(2)
+            content = stub_import(content, re.escape(ns_raw), func_name, None, verbose_prefix='[env catch-all] ')
+        return content
+
+    io_error_drop_instr = 'unreachable'
+    exit_instr = 'unreachable'
+    stdin_get_instr = 'unreachable'
+    stdout_get_instr = 'unreachable'
+    stderr_get_instr = 'unreachable'
+    output_stream_subscribe_instr = 'unreachable'
+    monotonic_now_instr = 'i64.const 0'
+    monotonic_subscribe_instr = 'unreachable'
+    wall_clock_now_instr = None
+    get_directories_instr = None
+    directory_entry_stream_drop_instr = None
+    read_directory_instr = None
+    read_directory_entry_instr = None
+    open_at_instr = None
+    get_flags_instr = None
+    stat_instr = None
+    stat_at_instr = None
+    metadata_hash_instr = None
+    metadata_hash_at_instr = None
+    random_bytes_instr = _RANDOM_GET_BYTES_BRIDGE
+
+    if use_wasi_p1_bridge:
+        content = ensure_func_import(
+            content,
+            'wasi_snapshot_preview1',
+            'random_get',
+            '(func $__wasi_snapshot_preview1_random_get (param i32 i32) (result i32))',
+        )
+        content = ensure_func_import(
+            content,
+            'wasi_snapshot_preview1',
+            'clock_time_get',
+            '(func $__wasi_snapshot_preview1_clock_time_get (param i32 i64 i32) (result i32))',
+        )
+        content = ensure_func_import(
+            content,
+            'wasi_snapshot_preview1',
+            'proc_exit',
+            '(func $__wasi_snapshot_preview1_proc_exit (param i32))',
+        )
+        content = ensure_func_import(
+            content,
+            'wasi_snapshot_preview1',
+            'fd_prestat_get',
+            '(func $__wasi_snapshot_preview1_fd_prestat_get (param i32 i32) (result i32))',
+        )
+        content = ensure_func_import(
+            content,
+            'wasi_snapshot_preview1',
+            'fd_prestat_dir_name',
+            '(func $__wasi_snapshot_preview1_fd_prestat_dir_name (param i32 i32 i32) (result i32))',
+        )
+        content = ensure_func_import(
+            content,
+            'wasi_snapshot_preview1',
+            'fd_readdir',
+            '(func $__wasi_snapshot_preview1_fd_readdir (param i32 i32 i32 i64 i32) (result i32))',
+        )
+        content = ensure_func_import(
+            content,
+            'wasi_snapshot_preview1',
+            'path_open',
+            '(func $__wasi_snapshot_preview1_path_open (param i32 i32 i32 i32 i32 i64 i64 i32 i32) (result i32))',
+        )
+        content = ensure_func_import(
+            content,
+            'wasi_snapshot_preview1',
+            'fd_filestat_get',
+            '(func $__wasi_snapshot_preview1_fd_filestat_get (param i32 i32) (result i32))',
+        )
+        content = ensure_func_import(
+            content,
+            'wasi_snapshot_preview1',
+            'path_filestat_get',
+            '(func $__wasi_snapshot_preview1_path_filestat_get (param i32 i32 i32 i32 i32) (result i32))',
+        )
+        io_error_drop_instr = 'nop'
+        exit_instr = _EXIT_BRIDGE_P1
+        stdin_get_instr = 'i32.const 0'
+        stdout_get_instr = 'i32.const 1'
+        stderr_get_instr = 'i32.const 2'
+        output_stream_subscribe_instr = 'i32.const 0'
+        monotonic_now_instr = _MONOTONIC_NOW_BRIDGE_P1
+        monotonic_subscribe_instr = 'i32.const 0'
+        wall_clock_now_instr = _WALL_CLOCK_NOW_BRIDGE_P1
+        get_directories_instr = _GET_DIRECTORIES_BRIDGE_P1
+        directory_entry_stream_drop_instr = _DIRECTORY_ENTRY_STREAM_DROP_BRIDGE_P1
+        read_directory_instr = _READ_DIRECTORY_BRIDGE_P1
+        read_directory_entry_instr = _READ_DIRECTORY_ENTRY_BRIDGE_P1
+        open_at_instr = _OPEN_AT_BRIDGE_P1
+        get_flags_instr = _GET_FLAGS_BRIDGE_P1
+        stat_instr = _STAT_BRIDGE_P1
+        stat_at_instr = _STAT_AT_BRIDGE_P1
+        metadata_hash_instr = _METADATA_HASH_BRIDGE_P1
+        metadata_hash_at_instr = _METADATA_HASH_AT_BRIDGE_P1
+        random_bytes_instr = _RANDOM_GET_BYTES_BRIDGE_P1
+
     stubs = [
-        ('wasi:io/error',                   '[resource-drop]error',                     'unreachable'),
+        ('wasi:io/error',                   '[resource-drop]error',                     io_error_drop_instr),
         ('wasi:io/poll',                     '[resource-drop]pollable',                  None),
         ('wasi:io/streams',                  '[resource-drop]input-stream',              None),
         ('wasi:io/streams',                  '[resource-drop]output-stream',             None),
         ('wasi:cli/terminal-input',          '[resource-drop]terminal-input',            None),
         ('wasi:cli/terminal-output',         '[resource-drop]terminal-output',           None),
         ('wasi:filesystem/types',            '[resource-drop]descriptor',                None),
-        ('wasi:filesystem/types',            '[resource-drop]directory-entry-stream',    None),
+        ('wasi:filesystem/types',            '[resource-drop]directory-entry-stream',    directory_entry_stream_drop_instr),
         ('wasi:cli/environment',             'get-environment',                          None),
-        ('wasi:cli/exit',                    'exit',                                     None),
+        ('wasi:cli/exit',                    'exit',                                     exit_instr),
         ('wasi:io/poll',                     '[method]pollable.block',                   None),
         ('wasi:io/poll',                     'poll',                                     None),
         ('wasi:io/streams',                  '[method]input-stream.subscribe',           'unreachable'),
@@ -153,27 +1175,32 @@ def perform_wasi_stubbing(content: str) -> str:
         ('wasi:io/streams',                  '[method]output-stream.write',              None),
         ('wasi:io/streams',                  '[method]output-stream.blocking-flush',     None),
         ('wasi:io/streams',                  '[method]output-stream.blocking-write-and-flush', None),
-        ('wasi:io/streams',                  '[method]output-stream.subscribe',          'unreachable'),
-        ('wasi:cli/stdin',                   'get-stdin',                                'unreachable'),
-        ('wasi:cli/stdout',                  'get-stdout',                               'unreachable'),
-        ('wasi:cli/stderr',                  'get-stderr',                               'unreachable'),
+        ('wasi:io/streams',                  '[method]output-stream.subscribe',          output_stream_subscribe_instr),
+        ('wasi:cli/stdin',                   'get-stdin',                                stdin_get_instr),
+        ('wasi:cli/stdout',                  'get-stdout',                               stdout_get_instr),
+        ('wasi:cli/stderr',                  'get-stderr',                               stderr_get_instr),
         ('wasi:cli/terminal-stdin',          'get-terminal-stdin',                       None),
         ('wasi:cli/terminal-stdout',         'get-terminal-stdout',                      None),
         ('wasi:cli/terminal-stderr',         'get-terminal-stderr',                      None),
-        ('wasi:clocks/monotonic-clock',      'now',                                      'i64.const 0'),
-        ('wasi:clocks/monotonic-clock',      'subscribe-instant',                        'unreachable'),
-        ('wasi:clocks/monotonic-clock',      'subscribe-duration',                       'unreachable'),
-        ('wasi:clocks/wall-clock',           'now',                                      None),
+        ('wasi:clocks/monotonic-clock',      'now',                                      monotonic_now_instr),
+        ('wasi:clocks/monotonic-clock',      'subscribe-instant',                        monotonic_subscribe_instr),
+        ('wasi:clocks/monotonic-clock',      'subscribe-duration',                       monotonic_subscribe_instr),
+        ('wasi:clocks/wall-clock',           'now',                                      wall_clock_now_instr),
         ('wasi:filesystem/types',            '[method]descriptor.read-via-stream',       None),
         ('wasi:filesystem/types',            '[method]descriptor.write-via-stream',      None),
         ('wasi:filesystem/types',            '[method]descriptor.append-via-stream',     None),
-        ('wasi:filesystem/types',            '[method]descriptor.get-flags',             None),
+        ('wasi:filesystem/types',            '[method]descriptor.get-flags',             get_flags_instr),
+        ('wasi:filesystem/types',            '[method]descriptor.read-directory',        read_directory_instr),
         ('wasi:filesystem/types',            '[method]descriptor.get-type',              None),
-        ('wasi:filesystem/types',            '[method]descriptor.stat',                  None),
-        ('wasi:filesystem/types',            '[method]descriptor.metadata-hash',         None),
+        ('wasi:filesystem/types',            '[method]descriptor.stat',                  stat_instr),
+        ('wasi:filesystem/types',            '[method]descriptor.stat-at',               stat_at_instr),
+        ('wasi:filesystem/types',            '[method]descriptor.open-at',               open_at_instr),
+        ('wasi:filesystem/types',            '[method]descriptor.metadata-hash',         metadata_hash_instr),
+        ('wasi:filesystem/types',            '[method]descriptor.metadata-hash-at',      metadata_hash_at_instr),
+        ('wasi:filesystem/types',            '[method]directory-entry-stream.read-directory-entry', read_directory_entry_instr),
         ('wasi:filesystem/types',            'filesystem-error-code',                    None),
-        ('wasi:filesystem/preopens',         'get-directories',                          None),
-        ('wasi:random/random',               'get-random-bytes',                         None),
+        ('wasi:filesystem/preopens',         'get-directories',                          get_directories_instr),
+        ('wasi:random/random',               'get-random-bytes',                         random_bytes_instr),
     ]
 
     for ns, func, repl_instr in stubs:
@@ -189,14 +1216,11 @@ def perform_wasi_stubbing(content: str) -> str:
         ns_raw, func_name = match.group(1), match.group(2)
         content = stub_import(content, re.escape(ns_raw), func_name, None, verbose_prefix='[wasi catch-all] ')
 
-    # Catch-all: stub any wasi_snapshot_preview1 imports (WASI preview 1)
-    wasi_p1_pattern = re.compile(r'\(\s*import\s*"(wasi_snapshot_preview1)"\s*"([^"]+)"')
-    while True:
-        match = wasi_p1_pattern.search(content)
-        if not match:
-            break
-        ns_raw, func_name = match.group(1), match.group(2)
-        content = stub_import(content, re.escape(ns_raw), func_name, None, verbose_prefix='[wasi-p1 catch-all] ')
+    # NOTE: wasi_snapshot_preview1 imports are NOT stubbed — Extism provides them natively
+    # when the plugin is loaded with withWasi: true (random_get, fd_write, clock_time_get, etc.)
+
+    if not stub_env:
+        return content
 
     # Catch-all: stub any remaining "env" imports (pthread, etc. from NativeAOT runtime)
     env_pattern = re.compile(r'\(\s*import\s*"(env)"\s*"([^"]+)"')
@@ -289,6 +1313,14 @@ def main():
         default='env,debug',
         help='Comma-separated list of namespaces to convert from kebab-case to snake_case (default: env,debug)',
     )
+    parser.add_argument(
+        '--keep-wasi-imports', action='store_true',
+        help='Keep wasi:* imports instead of replacing them with stubs.',
+    )
+    parser.add_argument(
+        '--wasi-p1-bridge', action='store_true',
+        help='When stubbing WASI P2 imports, bridge key calls via wasi_snapshot_preview1 imports.',
+    )
     args = parser.parse_args()
 
     convert_namespaces = [ns.strip() for ns in args.namespaces.split(',') if ns.strip()]
@@ -353,8 +1385,17 @@ def main():
         print('  Performing export name conversion...', file=sys.stderr)
         head = export_name_conversion(head)
 
-        print('  Performing WASI stubbing...', file=sys.stderr)
-        head = perform_wasi_stubbing(head)
+        if args.keep_wasi_imports:
+            print('  Preserving WASI imports (--keep-wasi-imports)...', file=sys.stderr)
+        else:
+            print('  Performing WASI stubbing...', file=sys.stderr)
+        if args.keep_wasi_imports and args.wasi_p1_bridge:
+            print('  Note: --wasi-p1-bridge ignored because --keep-wasi-imports is enabled.', file=sys.stderr)
+        head = perform_wasi_stubbing(
+            head,
+            stub_wasi=not args.keep_wasi_imports,
+            use_wasi_p1_bridge=args.wasi_p1_bridge,
+        )
 
         final_wat = head + tail
 
