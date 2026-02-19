@@ -182,6 +182,40 @@ def ensure_func_import(content: str, module: str, name: str, func_decl: str) -> 
     return content[:insert_at] + prefix + insertion + content[insert_at:]
 
 
+def resolve_cabi_realloc_target(content: str) -> str:
+    """Resolve the callable target for cabi_realloc in current WAT text.
+
+    Some modules expose `cabi_realloc` only via an export with a numeric func index,
+    without a `$cabi_realloc` symbol. In that case, callers must use `call <index>`.
+    """
+    if re.search(r'\(func\s+\$cabi_realloc\b', content):
+        return '$cabi_realloc'
+
+    named_export = re.search(
+        r'\(export\s+"cabi_realloc"\s+\(func\s+(\$[^)\s]+)\)\)',
+        content,
+    )
+    if named_export:
+        return named_export.group(1)
+
+    indexed_export = re.search(
+        r'\(export\s+"cabi_realloc"\s+\(func\s+(?:\(\;\d+;\)\s*)?(\d+)\)\)',
+        content,
+    )
+    if indexed_export:
+        return indexed_export.group(1)
+
+    return '$cabi_realloc'
+
+
+def normalize_cabi_realloc_calls(content: str) -> str:
+    """Rewrite `call $cabi_realloc` to the resolved callable target if needed."""
+    target = resolve_cabi_realloc_target(content)
+    if target == '$cabi_realloc':
+        return content
+    return re.sub(r'\bcall\s+\$cabi_realloc\b', f'call {target}', content)
+
+
 # Bridge instruction for get-random-bytes: func(len: u64) -> list<u8>
 # Canonical ABI lowering: (param i64 i32) — len + retptr, writes {ptr:i32, len:i32} to retptr
 # Allocates a buffer via cabi_realloc and returns it as a list (bytes are heap-residue,
@@ -1361,7 +1395,16 @@ def main():
 
         # Step 2: Convert to WAT
         print('  Converting to WAT...', file=sys.stderr)
-        wat_bytes = run_command(['wasm-tools', 'print', unbundled_module])
+        # Prefer naming unnamed items so later text edits are robust even when
+        # the module was built with aggressive stripping (numeric-only refs).
+        try:
+            wat_bytes = run_command(['wasm-tools', 'print', '--name-unnamed', unbundled_module])
+        except RuntimeError as exc:
+            err = str(exc)
+            if '--name-unnamed' in err and ('unexpected argument' in err or 'Found argument' in err):
+                wat_bytes = run_command(['wasm-tools', 'print', unbundled_module])
+            else:
+                raise
         wat = wat_bytes.decode('utf-8')
 
         if args.pre:
@@ -1398,6 +1441,7 @@ def main():
         )
 
         final_wat = head + tail
+        final_wat = normalize_cabi_realloc_calls(final_wat)
 
         print('  Fixing undefined_stub functions...', file=sys.stderr)
         final_wat = fix_undefined_stubs(final_wat)
